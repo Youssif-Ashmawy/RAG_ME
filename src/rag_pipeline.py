@@ -1,44 +1,45 @@
 """
-RAG pipeline — fully local via Ollama.
+RAG pipeline — fully local via Ollama + LangChain agent.
 
 Ingestion:
   1. Fetch ALL source files from GitHub (code + docs)
   2. Parse with language-aware AST/regex chunker
   3. Build import graph (file dependency edges)
-  4. Embed all chunks locally (nomic-embed-text)
-  5. Persist vector store + import graph to .rag-cache/
+  4. Embed all chunks locally (mxbai-embed-large)
+  5. Persist hybrid vector store + import graph to .rag-cache/
 
-Querying:
-  1. Embed the question
-  2. Semantic retrieval (cosine similarity, top-K)
-  3. Graph walk — add chunks from import-related files
-  4. Build enriched context prompt
-  5. Stream answer from llama3.2
+Querying (agent mode):
+  1. Hybrid retrieval (BM25 + cosine) for initial sources
+  2. Import-graph walk adds context from related files
+  3. LangChain tool-calling agent can search multiple times
+  4. Stream final answer token-by-token
 """
 
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Callable, Generator, Optional
 
-import ollama
-
+from .agent import run_agent_stream
 from .chunker import Chunk, chunk_files
 from .code_parser import parse_file
-from .embeddings import embed_text, embed_texts
+from .embeddings import embed_query, embed_texts
 from .github_client import fetch_repo_files
 from .import_graph import ImportGraph
+from .pdf_parser import parse_pdf
 from .vector_store import (
     SearchResult, VectorStore,
     get_store, set_store, _cache_dir,
 )
 
-GENERATION_MODEL = "llama3.2"
-EMBED_BATCH      = 50
-TOP_K_SEMANTIC   = 6    # semantic retrieval
-TOP_K_GRAPH      = 3    # extra chunks from graph neighbours
-GRAPH_DEPTH      = 1    # hops in the import graph
+EMBED_BATCH    = 50
+TOP_K_SEMANTIC = 8    # initial hybrid retrieval
+TOP_K_GRAPH    = 3    # extra chunks from graph neighbours
+GRAPH_DEPTH    = 1
+
+PDF_ID_PREFIX  = "pdf__"   # repo_id prefix for PDF-mode stores
 
 
 # ─────────────────────────────────────────────────────────────
@@ -81,7 +82,7 @@ class Source:
     unit_type: Optional[str]
     diagram_type: Optional[str]
     score: float
-    via_graph: bool       # True if added via import graph, not semantic search
+    via_graph: bool
     preview: str
 
 
@@ -107,18 +108,17 @@ def ingest_repo(
     progress(f"Parsing and chunking {len(files)} files…", 25)
     chunks = chunk_files(files)
 
-    # Build import graph from parsed files
     progress("Building import dependency graph…", 35)
-    all_paths = {f.path for f in files}
+    all_paths    = {f.path for f in files}
     parsed_files = [parse_file(f.content, f.path) for f in files]
-    graph = ImportGraph.build(parsed_files, all_paths)
+    graph        = ImportGraph.build(parsed_files, all_paths)
 
     progress(f"Embedding {len(chunks)} chunks locally…", 40)
-    texts = [c.text for c in chunks]
+    texts: list[str] = [c.text for c in chunks]
     all_embeddings: list[list[float]] = []
 
     for i in range(0, len(texts), EMBED_BATCH):
-        batch = texts[i: i + EMBED_BATCH]
+        batch = texts[i : i + EMBED_BATCH]
         all_embeddings.extend(embed_texts(batch))
         done = min(i + EMBED_BATCH, len(texts))
         pct  = 40 + int((done / len(texts)) * 50)
@@ -144,36 +144,87 @@ def ingest_repo(
 
 
 # ─────────────────────────────────────────────────────────────
-# Retrieval (semantic + graph-augmented)
+# PDF ingestion
+# ─────────────────────────────────────────────────────────────
+
+def ingest_pdf(
+    file_bytes: bytes,
+    filename: str,
+    on_progress: Optional[Callable[[str, int], None]] = None,
+) -> IngestResult:
+    """
+    Parse, chunk, embed and index a PDF file.
+    Uses the same VectorStore / agent infrastructure as GitHub repos.
+    The repo_id is derived from the filename so each PDF gets its own cache.
+    """
+    def progress(msg: str, pct: int) -> None:
+        if on_progress:
+            on_progress(msg, pct)
+
+    # Sanitise filename → stable repo_id
+    safe_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", filename)
+    repo_id   = f"{PDF_ID_PREFIX}{safe_name}"
+
+    progress("Parsing PDF…", 10)
+    chunks = parse_pdf(file_bytes, filename)
+
+    progress(f"Embedding {len(chunks)} chunks…", 30)
+    texts: list[str] = [c.text for c in chunks]
+    all_embeddings: list[list[float]] = []
+
+    for i in range(0, len(texts), EMBED_BATCH):
+        batch = texts[i : i + EMBED_BATCH]
+        all_embeddings.extend(embed_texts(batch))
+        done = min(i + EMBED_BATCH, len(texts))
+        pct  = 30 + int((done / len(texts)) * 60)
+        progress(f"Embedded {done}/{len(texts)} chunks…", pct)
+
+    progress("Saving index…", 95)
+    store = VectorStore()
+    store.add(chunks, all_embeddings)
+    store.save(repo_id)
+    set_store(repo_id, store)
+
+    progress("Done!", 100)
+    return IngestResult(
+        repo_id=repo_id,
+        files_count=1,
+        chunks_count=len(chunks),
+        graph_edges=0,
+        files=[{"path": filename, "file_type": "pdf", "chunks": len(chunks)}],
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Initial retrieval (for source display)
 # ─────────────────────────────────────────────────────────────
 
 def retrieve(repo_id: str, question: str) -> tuple[list[SearchResult], list[SearchResult]]:
     """
+    Hybrid retrieval (BM25 + cosine) + import-graph augmentation.
     Returns (semantic_results, graph_results).
-    semantic_results: top-K by cosine similarity
-    graph_results:    top chunks from import-adjacent files
     """
     store = get_store(repo_id)
     if store is None:
         raise ValueError(f"Repository '{repo_id}' is not indexed yet.")
 
-    query_vec = embed_text(question)
-    semantic  = store.search(query_vec, top_k=TOP_K_SEMANTIC)
+    query_vec = embed_query(question)
+    semantic  = store.hybrid_search(query_vec, question, top_k=TOP_K_SEMANTIC)
 
-    # Graph augmentation
     graph = _get_graph(repo_id)
     graph_results: list[SearchResult] = []
 
     if graph and graph.edge_count > 0:
-        matched_files = {r.chunk.path for r in semantic}
+        matched_files   = {r.chunk.path for r in semantic}
         neighbour_files: set[str] = set()
         for fp in matched_files:
             neighbour_files.update(graph.neighbours(fp, depth=GRAPH_DEPTH))
-        neighbour_files -= matched_files  # exclude already retrieved
+        neighbour_files -= matched_files
 
         if neighbour_files:
-            # Get the single best chunk from each neighbour file
-            all_candidates = store.search(query_vec, top_k=len(store._chunks))
+            all_candidates = store.hybrid_search(
+                query_vec, question, top_k=store.size
+            )
             seen_files: set[str] = set()
             for r in all_candidates:
                 if r.chunk.path in neighbour_files and r.chunk.path not in seen_files:
@@ -190,128 +241,42 @@ def build_sources(
     graph_results: list[SearchResult],
 ) -> list[Source]:
     sources: list[Source] = []
-    for r in semantic:
-        c = r.chunk
-        sources.append(Source(
-            path=c.path, raw_url=c.raw_url,
-            file_type=c.file_type, language=c.language,
-            heading=c.heading, unit_name=c.unit_name,
-            unit_type=c.unit_type, diagram_type=c.diagram_type,
-            score=r.score, via_graph=False,
-            preview=c.text[:200].replace("\n", " ").strip() + "…",
-        ))
-    for r in graph_results:
-        c = r.chunk
-        sources.append(Source(
-            path=c.path, raw_url=c.raw_url,
-            file_type=c.file_type, language=c.language,
-            heading=c.heading, unit_name=c.unit_name,
-            unit_type=c.unit_type, diagram_type=c.diagram_type,
-            score=r.score, via_graph=True,
-            preview=c.text[:200].replace("\n", " ").strip() + "…",
-        ))
+    for via_graph, results in [(False, semantic), (True, graph_results)]:
+        for r in results:
+            c = r.chunk
+            sources.append(Source(
+                path=c.path, raw_url=c.raw_url,
+                file_type=c.file_type, language=c.language,
+                heading=c.heading, unit_name=c.unit_name,
+                unit_type=c.unit_type, diagram_type=c.diagram_type,
+                score=r.score, via_graph=via_graph,
+                preview=c.text[:200].replace("\n", " ").strip() + "…",
+            ))
     return sources
 
 
 # ─────────────────────────────────────────────────────────────
-# Prompt building
-# ─────────────────────────────────────────────────────────────
-
-def _build_system_prompt(
-    semantic: list[SearchResult],
-    graph_results: list[SearchResult],
-    repo_id: str,
-) -> str:
-    graph = _get_graph(repo_id)
-
-    # ── Semantic context ──────────────────────────────────────
-    sem_blocks: list[str] = []
-    for i, r in enumerate(semantic, 1):
-        c = r.chunk
-        label = f"[Source {i}]"
-        if c.unit_name:
-            label += f" {c.language.title()} {c.unit_type} `{c.unit_name}` in {c.path}"
-        elif c.file_type == "mmd":
-            label += f" Mermaid {c.diagram_type} — {c.path}"
-        else:
-            label += f" {c.path}" + (f" › {c.heading}" if c.heading else "")
-        label += f"  (similarity: {r.score * 100:.0f}%)"
-
-        # Add graph context for this file
-        graph_info = ""
-        if graph:
-            summary = graph.summary(c.path)
-            if summary != "no resolved dependencies":
-                graph_info = f"\nFile relationships: {summary}"
-
-        sem_blocks.append(f"{label}{graph_info}\n\n{c.text}")
-
-    # ── Graph-augmented context ───────────────────────────────
-    graph_blocks: list[str] = []
-    for i, r in enumerate(graph_results, len(semantic) + 1):
-        c = r.chunk
-        label = f"[Source {i}] (via import graph)"
-        if c.unit_name:
-            label += f" {c.language.title()} {c.unit_type} `{c.unit_name}` in {c.path}"
-        else:
-            label += f" {c.path}"
-        graph_blocks.append(f"{label}\n\n{c.text}")
-
-    semantic_ctx = "\n\n---\n\n".join(sem_blocks)
-    graph_ctx    = "\n\n---\n\n".join(graph_blocks) if graph_blocks else ""
-
-    graph_section = ""
-    if graph_ctx:
-        graph_section = f"""
-
-RELATED FILES (retrieved via import dependency graph):
-{graph_ctx}"""
-
-    return f"""You are an expert software engineer assistant helping users understand a codebase.
-
-You have been given code and documentation excerpts retrieved from the repository, \
-plus related files discovered through the import dependency graph.
-
-DIRECTLY RELEVANT SOURCES:
-{semantic_ctx}{graph_section}
-
-INSTRUCTIONS FOR YOUR ANSWER:
-- Explain clearly what the code does, not just what it says.
-- Trace data flow and control flow across functions and files when relevant.
-- When multiple files interact, describe the chain: "A calls B, which uses C to..."
-- For Mermaid diagrams, explain what the diagram represents in plain language.
-- Point out design patterns, potential issues, or notable decisions if evident.
-- Reference sources with [Source N] labels.
-- If the context is insufficient to answer fully, say so and suggest what to look for."""
-
-
-# ─────────────────────────────────────────────────────────────
-# Streaming generation
+# Streaming generation (agent-powered)
 # ─────────────────────────────────────────────────────────────
 
 def stream_answer(
     repo_id: str,
     question: str,
-) -> Generator[str | list[Source], None, None]:
+) -> Generator[list[Source] | dict | str, None, None]:
     """
-    Yields list[Source] first, then str text chunks.
+    Yields:
+      list[Source]                          — initial retrieved sources
+      {"type": "tool_call", "name": str, "query": str}  — agent tool calls
+      str                                   — final answer text tokens
     """
+    store = get_store(repo_id)
+    if store is None:
+        raise ValueError(f"Repository '{repo_id}' is not indexed yet.")
+
+    # Initial retrieval — displayed as source cards immediately
     semantic, graph_results = retrieve(repo_id, question)
     sources = build_sources(semantic, graph_results)
-
     yield sources  # type: ignore[misc]
 
-    system_prompt = _build_system_prompt(semantic, graph_results, repo_id)
-
-    stream = ollama.chat(
-        model=GENERATION_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": question},
-        ],
-        stream=True,
-    )
-    for chunk in stream:
-        text = chunk.message.content
-        if text:
-            yield text
+    # Agent reasoning + streaming answer
+    yield from run_agent_stream(store, question)
