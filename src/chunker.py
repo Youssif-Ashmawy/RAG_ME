@@ -19,8 +19,8 @@ from typing import Optional
 from .code_parser import ParsedFile, ParsedUnit, detect_language, parse_file
 from .github_client import RepoFile
 
-MAX_CHUNK_CHARS = 1_800   # ~450 tokens — for doc files
-OVERLAP_CHARS   = 200
+MAX_CHUNK_CHARS = 2_400   # ~600 tokens — for doc files; embedding truncates at 1500 chars
+OVERLAP_CHARS   = 300     # carry-over between consecutive chunks
 
 
 # ---------------------------------------------------------------------------

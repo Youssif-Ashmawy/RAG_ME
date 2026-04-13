@@ -1,103 +1,102 @@
 """
-LangChain tool-calling agent for repository Q&A.
+Two-phase RAG agent for repository / document Q&A.
 
-The agent has two tools:
-  search_codebase  — hybrid search (BM25 + vector) over indexed chunks
-  get_file         — retrieve all chunks from a specific file path
+Phase 1 — Context gathering (ReAct agent, tool calls only):
+  The agent runs up to MAX_GATHER_ITERS steps using search/get tools to
+  collect relevant context.  Its own "Final Answer" text is discarded.
 
-Flow:
-  1. Agent decides which tools to call (and with what queries)
-  2. Tools return formatted context
-  3. Agent synthesises a final answer
-  4. Final answer is streamed token-by-token back to the caller
+Phase 2 — Direct synthesis (streaming ollama.chat):
+  All gathered context (initial retrieval + tool observations) is bundled
+  into a system prompt and streamed back token-by-token.
 
-Requires: langchain, langchain-ollama
+Why two phases?
+  Asking a 3B local model to simultaneously reason through a ReAct loop AND
+  write a comprehensive answer is too much.  Separating the two tasks makes
+  each one simple enough for the model to handle reliably.
 """
 
 from __future__ import annotations
 
-import threading
-from queue import Empty, Queue
-from typing import Any, Generator, Optional
+from typing import Generator, Literal
 
-from langchain_core.callbacks import BaseCallbackHandler
-from langchain_core.messages import AIMessage
-from langchain_core.outputs import LLMResult
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.tools import tool
-from langchain.agents import AgentExecutor, create_tool_calling_agent
+import ollama
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain_core.prompts import PromptTemplate
+from langchain_core.tools import Tool
 from langchain_ollama import ChatOllama
 
 from .embeddings import embed_query
 from .vector_store import VectorStore
 
-AGENT_MODEL  = "llama3.2"
-TOP_K_AGENT  = 5     # results per search_codebase call
-MAX_ITERS    = 6     # max agent reasoning steps
+AGENT_MODEL     = "llama3.2"
+NUM_CTX         = 8192   # override Ollama's 2048-token default
+TOP_K_AGENT     = 6      # results per tool search call
+MAX_GATHER_ITERS = 4     # max tool-call steps in phase 1
 
-SYSTEM_PROMPT = """\
-You are an expert software engineer assistant. You have access to a fully indexed \
-code repository and can search it using the tools provided.
-
-Guidelines:
-- Use search_codebase to find relevant functions, classes, or documentation.
-- Use get_file when you know the exact file path and need its full content.
-- Call tools multiple times with different queries if the first result is insufficient.
-- After gathering enough context, write a thorough answer:
-    • Explain what the code does, not just what it says.
-    • Trace data flow and control flow across files when relevant.
-    • Describe design patterns or notable architectural decisions.
-    • Reference sources by file path and function/class name.
-- If the context is insufficient, say so and suggest what to look for."""
+SourceType = Literal["code", "document"]
 
 
 # ─────────────────────────────────────────────────────────────
-# Streaming callback
+# Phase-1 ReAct prompt  (gather context, don't write final answer)
 # ─────────────────────────────────────────────────────────────
 
-class _TokenQueue(BaseCallbackHandler):
-    """Pushes LLM tokens into a thread-safe queue for the generator to read."""
+_GATHER_TMPL = """\
+You are a research assistant gathering information to answer a question.
+Your ONLY job is to search for relevant content using the tools below.
+Do NOT try to answer the question yourself — just search.
 
-    DONE = object()  # sentinel
+Available tools:
+{tools}
 
-    def __init__(self) -> None:
-        self.q: Queue = Queue()
+Format EXACTLY:
+Thought: what to search for next
+Action: {tool_names}
+Action Input: search query as plain text
+Observation: <tool result>
+... repeat 1-3 times ...
+Thought: I have gathered enough context
+Final Answer: done
 
-    def on_llm_new_token(self, token: str, **_: Any) -> None:
-        self.q.put(token)
+Rules:
+- Action must be one of: {tool_names}
+- Action Input is a plain string, never JSON
+- Stop after 1-3 searches
+- If unsure what sections/files exist, use list_sections or list_files first
 
-    def on_llm_end(self, response: LLMResult, **_: Any) -> None:
-        self.q.put(self.DONE)
+Begin!
 
-    def on_llm_error(self, error: Exception, **_: Any) -> None:
-        self.q.put(self.DONE)
+Question: {input}
+{agent_scratchpad}"""
 
 
 # ─────────────────────────────────────────────────────────────
-# Agent factory
+# Phase-2 synthesis prompts
 # ─────────────────────────────────────────────────────────────
 
-def build_agent(store: VectorStore) -> AgentExecutor:
-    """
-    Build a tool-calling AgentExecutor bound to the given VectorStore.
-    The LLM used for tool-calling decisions is non-streaming; the final
-    synthesis step is handled separately with a streaming LLM.
-    """
+_CODE_SYNTHESIS = """\
+You are an expert software engineer. Answer the question using ONLY the retrieved context below.
+- Explain what the code does, trace data flow across files, highlight design patterns.
+- Reference sources by file path and function/class name.
+- Be thorough and specific. If context is insufficient, say so."""
 
-    # ── Tools ────────────────────────────────────────────────────
+_DOCUMENT_SYNTHESIS = """\
+You are a precise document analyst. Answer the question using ONLY the retrieved context below.
+- Cite page numbers and section headings for every claim you make.
+- Quote directly when exact wording matters.
+- Be thorough. If the document lacks the information, say so explicitly."""
 
-    @tool
-    def search_codebase(query: str) -> str:
-        """
-        Search the indexed repository for code, documentation, or concepts
-        matching the query. Returns the most relevant snippets with file paths.
-        Use different queries to find different aspects.
-        """
+
+# ─────────────────────────────────────────────────────────────
+# Tool implementations (shared between modes)
+# ─────────────────────────────────────────────────────────────
+
+def _make_tools(store: VectorStore, is_doc: bool) -> list[Tool]:
+    def _search(query: str) -> str:
         q_vec   = embed_query(query)
         results = store.hybrid_search(q_vec, query, top_k=TOP_K_AGENT)
         if not results:
             return "No results found."
-        lines: list[str] = []
+        parts: list[str] = []
         for r in results:
             c = r.chunk
             label = c.path
@@ -105,105 +104,167 @@ def build_agent(store: VectorStore) -> AgentExecutor:
                 label += f" :: {c.unit_name} ({c.unit_type})"
             elif c.heading:
                 label += f" › {c.heading}"
-            lines.append(f"[{label}]\n{c.text}\n")
-        return "\n---\n".join(lines)
+            parts.append(f"[{label}]\n{c.text}")
+        return "\n---\n".join(parts)
 
-    @tool
-    def get_file(path: str) -> str:
-        """
-        Retrieve the full indexed content of a specific file by its exact path
-        (e.g. 'src/auth.py'). Use this when search_codebase points to a file
-        but you need more complete context.
-        """
-        chunks = store.chunks_for_file(path)
+    def _fetch(ref: str) -> str:
+        chunks = store.chunks_for_file(ref)
         if not chunks:
-            # Try case-insensitive partial match
-            path_lower = path.lower()
+            ref_lower = ref.lower()
             chunks = [
                 c for c in store._chunks
-                if path_lower in c.path.lower()
+                if ref_lower in (c.heading or "").lower()
+                or ref_lower in c.path.lower()
             ]
         if not chunks:
-            return f"File '{path}' not found in the index."
+            return f"'{ref}' not found in the index."
         return "\n\n---\n\n".join(c.text for c in chunks)
 
-    tools = [search_codebase, get_file]
+    def _list_sections(_input: str) -> str:
+        """Return all unique headings/sections indexed in the document."""
+        headings: list[str] = []
+        seen: set[str] = set()
+        for c in store._chunks:
+            h = c.heading or c.unit_name or c.path
+            if h and h not in seen:
+                seen.add(h)
+                headings.append(h)
+        if not headings:
+            return "No sections found in index."
+        return "Indexed sections:\n" + "\n".join(f"- {h}" for h in headings)
 
-    # ── LLM (non-streaming for tool-call decisions) ───────────────
-    llm = ChatOllama(model=AGENT_MODEL, temperature=0)
+    def _list_files(_input: str) -> str:
+        """Return all unique file paths indexed."""
+        paths = sorted({c.path for c in store._chunks})
+        if not paths:
+            return "No files found in index."
+        return "Indexed files:\n" + "\n".join(f"- {p}" for p in paths)
 
-    # ── Prompt ────────────────────────────────────────────────────
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
-        ("human", "{input}"),
-        MessagesPlaceholder("agent_scratchpad"),
-    ])
-
-    agent    = create_tool_calling_agent(llm, tools, prompt)
-    executor = AgentExecutor(
-        agent=agent,
-        tools=tools,
-        max_iterations=MAX_ITERS,
-        return_intermediate_steps=True,
-        verbose=False,
-    )
-    return executor
+    if is_doc:
+        return [
+            Tool(name="search_document", func=_search,
+                 description="Search the PDF for passages. Input: plain text query."),
+            Tool(name="get_section",     func=_fetch,
+                 description="Get full text of a section by heading. Input: heading string."),
+            Tool(name="list_sections",   func=_list_sections,
+                 description="List all sections/headings indexed in the document. Input: any string (ignored)."),
+        ]
+    else:
+        return [
+            Tool(name="search_codebase", func=_search,
+                 description="Search the codebase for code or docs. Input: plain text query."),
+            Tool(name="get_file",        func=_fetch,
+                 description="Get full content of a file by path. Input: file path string."),
+            Tool(name="list_files",      func=_list_files,
+                 description="List all files indexed in the codebase. Input: any string (ignored)."),
+        ]
 
 
 # ─────────────────────────────────────────────────────────────
-# Streaming runner
+# Phase 1 — context-gathering agent
+# ─────────────────────────────────────────────────────────────
+
+def _gather_context(
+    store: VectorStore,
+    question: str,
+    source_type: SourceType,
+) -> tuple[list[dict], list[str]]:
+    """
+    Run the ReAct agent in gather-only mode.
+
+    Returns:
+      tool_events   — list of {"type":"tool_call","name":...,"query":...} for the UI
+      observations  — list of raw tool result strings
+    """
+    is_doc = source_type == "document"
+    tools  = _make_tools(store, is_doc)
+
+    prompt = PromptTemplate.from_template(_GATHER_TMPL)
+    llm    = ChatOllama(model=AGENT_MODEL, temperature=0, num_ctx=NUM_CTX)
+
+    agent    = create_react_agent(llm, tools, prompt)
+    executor = AgentExecutor(
+        agent=agent,
+        tools=tools,
+        max_iterations=MAX_GATHER_ITERS,
+        handle_parsing_errors=True,
+        return_intermediate_steps=True,
+        verbose=False,
+    )
+
+    try:
+        result = executor.invoke({"input": question})
+    except Exception:
+        result = {"intermediate_steps": []}
+
+    tool_events:  list[dict] = []
+    observations: list[str]  = []
+
+    for action, obs in result.get("intermediate_steps", []):
+        tool_name  = getattr(action, "tool", "")
+        tool_input = getattr(action, "tool_input", "")
+        query = tool_input if isinstance(tool_input, str) else str(tool_input)
+        tool_events.append({"type": "tool_call", "name": tool_name, "query": query})
+        if isinstance(obs, str) and obs.strip():
+            observations.append(obs)
+
+    return tool_events, observations
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 2 — direct streaming synthesis
+# ─────────────────────────────────────────────────────────────
+
+def _synthesise(
+    question: str,
+    source_type: SourceType,
+    initial_context: str,
+    tool_observations: list[str],
+) -> Generator[str, None, None]:
+    """Stream the final answer from the LLM given all gathered context."""
+    base_prompt = _DOCUMENT_SYNTHESIS if source_type == "document" else _CODE_SYNTHESIS
+
+    context_parts: list[str] = []
+    if initial_context:
+        context_parts.append(initial_context)
+    context_parts.extend(tool_observations)
+
+    context_block = "\n\n---\n\n".join(context_parts)
+    system = f"{base_prompt}\n\n{context_block}" if context_block else base_prompt
+
+    stream = ollama.chat(
+        model=AGENT_MODEL,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user",   "content": question},
+        ],
+        stream=True,
+        options={"num_ctx": NUM_CTX},
+    )
+    for chunk in stream:
+        text = chunk.message.content
+        if text:
+            yield text
+
+
+# ─────────────────────────────────────────────────────────────
+# Public entry point
 # ─────────────────────────────────────────────────────────────
 
 def run_agent_stream(
     store: VectorStore,
     question: str,
+    source_type: SourceType = "code",
+    initial_context: str = "",
 ) -> Generator[dict | str, None, None]:
     """
-    Run the agent and stream results back.
-
     Yields:
-      {"type": "tool_call", "name": str, "query": str}  — when a tool is invoked
+      {"type": "tool_call", "name": str, "query": str}  — each tool invocation
       str                                                 — final answer tokens
     """
-    executor = build_agent(store)
+    # Phase 1: gather additional context via tools
+    tool_events, observations = _gather_context(store, question, source_type)
+    yield from tool_events
 
-    # Run agent (non-streaming) to collect tool calls + final output
-    result = executor.invoke({"input": question})
-
-    # Emit tool call notifications so the UI can show what was searched
-    for action, _observation in result.get("intermediate_steps", []):
-        tool_input = action.tool_input
-        query = (
-            tool_input.get("query") or tool_input.get("path") or str(tool_input)
-            if isinstance(tool_input, dict) else str(tool_input)
-        )
-        yield {"type": "tool_call", "name": action.tool, "query": query}
-
-    # Stream the final answer token-by-token
-    final_answer: str = result.get("output", "")
-    if not final_answer:
-        return
-
-    token_cb  = _TokenQueue()
-    streaming_llm = ChatOllama(
-        model=AGENT_MODEL,
-        temperature=0,
-        streaming=True,
-        callbacks=[token_cb],
-    )
-
-    def _stream_in_thread() -> None:
-        streaming_llm.invoke(
-            [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": question},
-                {"role": "assistant", "content": final_answer},
-            ]
-        )
-
-    # We already have the full answer from the agent run.
-    # Stream it character-by-character to simulate token streaming
-    # without a second LLM call — gives smooth UI without extra latency.
-    chunk_size = 4
-    for i in range(0, len(final_answer), chunk_size):
-        yield final_answer[i : i + chunk_size]
+    # Phase 2: synthesise and stream the answer
+    yield from _synthesise(question, source_type, initial_context, observations)

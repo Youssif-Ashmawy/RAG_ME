@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 # Maximum characters kept per unit before truncation
-MAX_UNIT_CHARS = 1_200
+MAX_UNIT_CHARS = 2_000   # embedding truncates at 1500 chars; extra goes to LLM only
 
 # ---------------------------------------------------------------------------
 # Language detection

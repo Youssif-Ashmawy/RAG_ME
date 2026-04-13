@@ -9,10 +9,11 @@ Ingestion:
   5. Persist hybrid vector store + import graph to .rag-cache/
 
 Querying (agent mode):
-  1. Hybrid retrieval (BM25 + cosine) for initial sources
-  2. Import-graph walk adds context from related files
-  3. LangChain tool-calling agent can search multiple times
-  4. Stream final answer token-by-token
+  1. Multi-query expansion — LLM generates 2 alternative phrasings
+  2. Hybrid retrieval (BM25 + cosine) for each query, results merged + boosted
+  3. Import-graph walk adds context from related files
+  4. Initial context passed directly to agent (no cold start)
+  5. Agent searches further if needed, then streams final answer
 """
 
 from __future__ import annotations
@@ -21,6 +22,8 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Callable, Generator, Optional
+
+import ollama
 
 from .agent import run_agent_stream
 from .chunker import Chunk, chunk_files
@@ -34,12 +37,13 @@ from .vector_store import (
     get_store, set_store, _cache_dir,
 )
 
-EMBED_BATCH    = 50
-TOP_K_SEMANTIC = 8    # initial hybrid retrieval
-TOP_K_GRAPH    = 3    # extra chunks from graph neighbours
-GRAPH_DEPTH    = 1
-
-PDF_ID_PREFIX  = "pdf__"   # repo_id prefix for PDF-mode stores
+GENERATION_MODEL = "llama3.2"
+EMBED_BATCH      = 50
+TOP_K_SEMANTIC   = 14   # chunks retrieved per query pass
+TOP_K_FINAL      = 10   # chunks kept after multi-query merge
+TOP_K_GRAPH      = 4    # extra chunks from graph neighbours
+GRAPH_DEPTH      = 1
+PDF_ID_PREFIX    = "pdf__"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -152,16 +156,10 @@ def ingest_pdf(
     filename: str,
     on_progress: Optional[Callable[[str, int], None]] = None,
 ) -> IngestResult:
-    """
-    Parse, chunk, embed and index a PDF file.
-    Uses the same VectorStore / agent infrastructure as GitHub repos.
-    The repo_id is derived from the filename so each PDF gets its own cache.
-    """
     def progress(msg: str, pct: int) -> None:
         if on_progress:
             on_progress(msg, pct)
 
-    # Sanitise filename → stable repo_id
     safe_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", filename)
     repo_id   = f"{PDF_ID_PREFIX}{safe_name}"
 
@@ -196,20 +194,102 @@ def ingest_pdf(
 
 
 # ─────────────────────────────────────────────────────────────
-# Initial retrieval (for source display)
+# Multi-query expansion
+# ─────────────────────────────────────────────────────────────
+
+def _expand_queries(question: str) -> list[str]:
+    """
+    Ask the LLM to generate 2 alternative search queries for the question.
+    Returns [original] + up to 2 alternatives.
+    Fails gracefully — returns [original] on any error.
+    """
+    try:
+        resp = ollama.chat(
+            model=GENERATION_MODEL,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Write 2 short search queries to find information relevant to this question. "
+                    "Output only the queries, one per line, no numbering or explanation.\n\n"
+                    f"Question: {question}"
+                ),
+            }],
+            stream=False,
+            options={"num_predict": 60},
+        )
+        lines = [
+            ln.strip() for ln in resp.message.content.strip().split("\n")
+            if ln.strip() and ln.strip() != question
+        ]
+        return [question] + lines[:2]
+    except Exception:
+        return [question]
+
+
+def _multi_retrieve(
+    store: VectorStore,
+    question: str,
+    top_k_per_query: int,
+    top_k_final: int,
+) -> list[SearchResult]:
+    """
+    Run hybrid search for each expanded query, merge results, and re-rank.
+
+    Scoring:
+      - Base score = highest RRF score seen for the chunk across all queries
+      - Multi-query bonus: +15 % per additional query that also retrieved the chunk
+        (chunks relevant to multiple phrasings are more likely to be truly relevant)
+    """
+    queries = _expand_queries(question)
+
+    score_map: dict[str, float] = {}   # chunk_id → best base score
+    chunk_map: dict[str, SearchResult] = {}
+    hit_count: dict[str, int] = {}
+
+    for q in queries:
+        q_vec   = embed_query(q)
+        results = store.hybrid_search(q_vec, q, top_k=top_k_per_query)
+        for r in results:
+            cid = r.chunk.id
+            if cid not in score_map or r.score > score_map[cid]:
+                score_map[cid] = r.score
+                chunk_map[cid] = r
+            hit_count[cid] = hit_count.get(cid, 0) + 1
+
+    # Apply multi-query agreement bonus then sort
+    boosted: list[SearchResult] = []
+    for cid, r in chunk_map.items():
+        bonus = 1.0 + 0.15 * (hit_count[cid] - 1)
+        boosted.append(SearchResult(chunk=r.chunk, score=r.score * bonus))
+
+    boosted.sort(key=lambda r: r.score, reverse=True)
+
+    # Re-apply file diversity cap (3 per file) and cap final count
+    file_count: dict[str, int] = {}
+    results: list[SearchResult] = []
+    for r in boosted:
+        fc = file_count.get(r.chunk.path, 0)
+        if fc < 3 and len(results) < top_k_final:
+            results.append(r)
+            file_count[r.chunk.path] = fc + 1
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────────
+# Retrieval
 # ─────────────────────────────────────────────────────────────
 
 def retrieve(repo_id: str, question: str) -> tuple[list[SearchResult], list[SearchResult]]:
     """
-    Hybrid retrieval (BM25 + cosine) + import-graph augmentation.
+    Multi-query hybrid retrieval + import-graph augmentation.
     Returns (semantic_results, graph_results).
     """
     store = get_store(repo_id)
     if store is None:
         raise ValueError(f"Repository '{repo_id}' is not indexed yet.")
 
-    query_vec = embed_query(question)
-    semantic  = store.hybrid_search(query_vec, question, top_k=TOP_K_SEMANTIC)
+    semantic = _multi_retrieve(store, question, TOP_K_SEMANTIC, TOP_K_FINAL)
 
     graph = _get_graph(repo_id)
     graph_results: list[SearchResult] = []
@@ -222,9 +302,9 @@ def retrieve(repo_id: str, question: str) -> tuple[list[SearchResult], list[Sear
         neighbour_files -= matched_files
 
         if neighbour_files:
-            all_candidates = store.hybrid_search(
-                query_vec, question, top_k=store.size
-            )
+            # Cap graph search at 100 candidates for large repos
+            q_vec          = embed_query(question)
+            all_candidates = store.hybrid_search(q_vec, question, top_k=min(store.size, 100))
             seen_files: set[str] = set()
             for r in all_candidates:
                 if r.chunk.path in neighbour_files and r.chunk.path not in seen_files:
@@ -255,6 +335,40 @@ def build_sources(
     return sources
 
 
+_CONTEXT_SNIPPET_CHARS = 400   # chars per chunk in the agent's initial context
+_CONTEXT_MAX_CHUNKS    = 4     # how many chunks to include (full text available via tools)
+
+
+def _format_context(
+    semantic: list[SearchResult],
+    graph_results: list[SearchResult],
+) -> str:
+    """
+    Build a short initial-context string for the agent prompt.
+
+    We pass only the top few chunks at ~400 chars each (~100 tokens each).
+    This keeps the initial prompt under ~600 tokens so the model's 8192-token
+    context window is mostly free for the ReAct loop and tool observations.
+    Full chunk bodies are always retrievable via the search/get tools.
+    """
+    parts: list[str] = []
+    all_results = semantic[:_CONTEXT_MAX_CHUNKS] + graph_results[:1]
+
+    for r in all_results:
+        c = r.chunk
+        label = c.path
+        if c.unit_name:
+            label += f" :: {c.unit_name}"
+        elif c.heading:
+            label += f" › {c.heading}"
+        snippet = c.text[:_CONTEXT_SNIPPET_CHARS].replace("\n", " ").strip()
+        if len(c.text) > _CONTEXT_SNIPPET_CHARS:
+            snippet += "…"
+        parts.append(f"[{label}]\n{snippet}")
+
+    return "\n\n".join(parts)
+
+
 # ─────────────────────────────────────────────────────────────
 # Streaming generation (agent-powered)
 # ─────────────────────────────────────────────────────────────
@@ -265,18 +379,29 @@ def stream_answer(
 ) -> Generator[list[Source] | dict | str, None, None]:
     """
     Yields:
-      list[Source]                          — initial retrieved sources
-      {"type": "tool_call", "name": str, "query": str}  — agent tool calls
-      str                                   — final answer text tokens
+      list[Source]                                          — retrieved source cards
+      {"type": "status",   "msg": str}                     — pipeline status updates
+      {"type": "tool_call","name": str, "query": str}      — agent tool invocations
+      str                                                   — final answer characters
     """
     store = get_store(repo_id)
     if store is None:
         raise ValueError(f"Repository '{repo_id}' is not indexed yet.")
 
-    # Initial retrieval — displayed as source cards immediately
+    source_type = "document" if repo_id.startswith(PDF_ID_PREFIX) else "code"
+
+    # Multi-query retrieval
+    yield {"type": "status", "msg": "Expanding queries and retrieving context…"}
     semantic, graph_results = retrieve(repo_id, question)
     sources = build_sources(semantic, graph_results)
     yield sources  # type: ignore[misc]
 
-    # Agent reasoning + streaming answer
-    yield from run_agent_stream(store, question)
+    # Pass the full retrieved context to the agent so it doesn't start cold
+    initial_context = _format_context(semantic, graph_results)
+
+    yield {"type": "status", "msg": "Agent reasoning…"}
+    yield from run_agent_stream(
+        store, question,
+        source_type=source_type,
+        initial_context=initial_context,
+    )

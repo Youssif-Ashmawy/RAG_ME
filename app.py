@@ -448,11 +448,12 @@ else:
                         status_slot.markdown(
                             f"*Found {len(collected_sources)} relevant source(s)…*"
                         )
+                    elif isinstance(item, dict) and item.get("type") == "status":
+                        status_slot.markdown(f"*{item['msg']}*")
                     elif isinstance(item, dict) and item.get("type") == "tool_call":
-                        # Agent is doing a follow-up search
-                        icon = "🔍" if item["name"] == "search_codebase" else "📄"
+                        icon = "🔍" if "search" in item["name"] else "📄"
                         status_slot.markdown(
-                            f"*{icon} Agent searching: `{item['query']}`…*"
+                            f"*{icon} Agent: `{item['query']}`…*"
                         )
                     else:
                         full_answer += item

@@ -24,7 +24,7 @@ from .chunker import Chunk
 
 CACHE_ROOT   = ".rag-cache"
 RRF_K        = 60    # RRF constant — higher = smoother blend
-MAX_PER_FILE = 2     # diversity cap per source file
+MAX_PER_FILE = 3     # diversity cap per source file (raised from 2)
 
 
 @dataclass
