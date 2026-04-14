@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Generator, Optional
 
 import groq as groq_sdk
@@ -51,6 +53,27 @@ PDF_ID_PREFIX    = "pdf__"
 # ─────────────────────────────────────────────────────────────
 
 _graph_cache: dict[str, ImportGraph] = {}
+
+
+# ─────────────────────────────────────────────────────────────
+# Cache management
+# ─────────────────────────────────────────────────────────────
+
+def _clear_other_caches(current_repo_id: str) -> None:
+    """Delete every cached index except the one just created."""
+    from .vector_store import _store_cache, CACHE_ROOT
+    cache_root = Path(CACHE_ROOT)
+    if cache_root.exists():
+        for child in cache_root.iterdir():
+            if child.is_dir() and child.name != current_repo_id:
+                shutil.rmtree(child, ignore_errors=True)
+    # Evict stale in-memory stores and graphs
+    for key in list(_store_cache.keys()):
+        if key != current_repo_id:
+            del _store_cache[key]
+    for key in list(_graph_cache.keys()):
+        if key != current_repo_id:
+            del _graph_cache[key]
 
 
 def _get_graph(repo_id: str) -> Optional[ImportGraph]:
@@ -136,6 +159,7 @@ def ingest_repo(
     graph.save(cache_dir)
     set_store(meta.repo_id, store)
     _graph_cache[meta.repo_id] = graph
+    _clear_other_caches(meta.repo_id)
 
     progress("Done! Repository fully indexed.", 100)
     return IngestResult(
@@ -182,6 +206,7 @@ def ingest_pdf(
     store.add(chunks, all_embeddings)
     store.save(repo_id)
     set_store(repo_id, store)
+    _clear_other_caches(repo_id)
 
     progress("Done!", 100)
     return IngestResult(

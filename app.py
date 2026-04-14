@@ -15,11 +15,31 @@ from dotenv import load_dotenv
 load_dotenv()
 sys.path.insert(0, os.path.dirname(__file__))
 
+import groq as _groq_sdk  # noqa: E402
+
 from src.rag_pipeline import IngestResult, Source, ingest_repo, ingest_pdf, stream_answer  # noqa: E402
+
+
+def _validate_groq_key(key: str) -> tuple[bool, str]:
+    """Return (is_valid, error_message). Makes a minimal API call to verify the key."""
+    try:
+        client = _groq_sdk.Groq(api_key=key)
+        client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1,
+        )
+        return True, ""
+    except _groq_sdk.AuthenticationError:
+        return False, "Invalid API key — check your key at console.groq.com"
+    except _groq_sdk.APIConnectionError:
+        return False, "Could not reach Groq — check your internet connection"
+    except Exception as exc:
+        return False, f"Unexpected error: {exc}"
 
 # ── Page config ───────────────────────────────────────────────
 st.set_page_config(
-    page_title="GitHub RAG",
+    page_title="RAG ME!",
     page_icon="📚",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -29,6 +49,7 @@ st.set_page_config(
 st.markdown(
     """
     <style>
+    [data-testid="InputInstructions"] { display: none; }
     .stChatMessage { padding: 0.5rem 0; }
     .source-card {
         background: #1e1e2e;
@@ -148,7 +169,7 @@ def render_sources(sources: list) -> None:
 # ═════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    st.markdown("## 📚 RAG Assistant")
+    st.markdown("## 📚 RAG ME Assistant")
     st.divider()
 
     # ── Groq API key ─────────────────────────────────────────
@@ -163,17 +184,28 @@ with st.sidebar:
             st.rerun()
     else:
         st.markdown("**Enter your Groq API key to get started**")
-        key_input = st.text_input(
-            "Groq API key",
-            type="password",
-            placeholder="gsk_...",
-            help="Get a free key at console.groq.com",
-            label_visibility="collapsed",
-        )
-        if key_input.strip():
-            st.session_state.groq_api_key = key_input.strip()
-            os.environ["GROQ_API_KEY"] = key_input.strip()
-            st.rerun()
+        with st.form("groq_key_form", border=False):
+            key_input = st.text_input(
+                "Groq API key",
+                type="password",
+                placeholder="gsk_...",
+                label_visibility="collapsed",
+            )
+            submitted = st.form_submit_button(
+                "Connect", use_container_width=True, type="primary"
+            )
+        if submitted:
+            if not key_input.strip():
+                st.error("Please enter an API key.")
+            else:
+                with st.spinner("Validating key…"):
+                    valid, err = _validate_groq_key(key_input.strip())
+                if valid:
+                    st.session_state.groq_api_key = key_input.strip()
+                    os.environ["GROQ_API_KEY"] = key_input.strip()
+                    st.rerun()
+                else:
+                    st.error(err)
         st.caption("Get a free key at [console.groq.com](https://console.groq.com)")
         st.stop()
 
@@ -413,7 +445,7 @@ if not st.session_state.repo_id:
 
     st.markdown(
         "<div style='text-align:center;color:#555;font-size:0.8rem;margin-top:2rem'>"
-        "Runs fully locally via <strong>Ollama</strong> — no API key needed"
+        "Made by Youssif Ashmawy 🚀 - Hope that helps!"
         "</div>",
         unsafe_allow_html=True,
     )
