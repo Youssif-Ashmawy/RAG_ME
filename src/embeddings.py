@@ -15,7 +15,7 @@ import ollama
 EMBEDDING_MODEL = "mxbai-embed-large"
 QUERY_PREFIX    = "Represent this sentence for searching relevant passages: "
 BATCH_SIZE      = 50
-MAX_EMBED_CHARS = 1_500
+MAX_EMBED_CHARS = 800   # mxbai-embed-large: 512-token ctx; dense code ~2 chars/token → 400 tokens
 
 
 def embed_texts(texts: list[str], **_) -> list[list[float]]:
