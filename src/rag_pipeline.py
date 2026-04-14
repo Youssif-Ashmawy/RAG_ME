@@ -23,7 +23,7 @@ import re
 from dataclasses import dataclass
 from typing import Callable, Generator, Optional
 
-import ollama
+import groq as groq_sdk
 
 from .agent import run_agent_stream
 from .chunker import Chunk, chunk_files
@@ -37,7 +37,7 @@ from .vector_store import (
     get_store, set_store, _cache_dir,
 )
 
-GENERATION_MODEL = "llama3.2"
+GENERATION_MODEL = "llama-3.3-70b-versatile"
 EMBED_BATCH      = 50
 TOP_K_SEMANTIC   = 14   # chunks retrieved per query pass
 TOP_K_FINAL      = 10   # chunks kept after multi-query merge
@@ -197,14 +197,15 @@ def ingest_pdf(
 # Multi-query expansion
 # ─────────────────────────────────────────────────────────────
 
-def _expand_queries(question: str) -> list[str]:
+def _expand_queries(question: str, api_key: str = "") -> list[str]:
     """
     Ask the LLM to generate 2 alternative search queries for the question.
     Returns [original] + up to 2 alternatives.
     Fails gracefully — returns [original] on any error.
     """
     try:
-        resp = ollama.chat(
+        client = groq_sdk.Groq(api_key=api_key or os.environ.get("GROQ_API_KEY", ""))
+        resp = client.chat.completions.create(
             model=GENERATION_MODEL,
             messages=[{
                 "role": "user",
@@ -214,11 +215,10 @@ def _expand_queries(question: str) -> list[str]:
                     f"Question: {question}"
                 ),
             }],
-            stream=False,
-            options={"num_predict": 60},
+            max_tokens=60,
         )
         lines = [
-            ln.strip() for ln in resp.message.content.strip().split("\n")
+            ln.strip() for ln in resp.choices[0].message.content.strip().split("\n")
             if ln.strip() and ln.strip() != question
         ]
         return [question] + lines[:2]
@@ -231,6 +231,7 @@ def _multi_retrieve(
     question: str,
     top_k_per_query: int,
     top_k_final: int,
+    api_key: str = "",
 ) -> list[SearchResult]:
     """
     Run hybrid search for each expanded query, merge results, and re-rank.
@@ -240,7 +241,7 @@ def _multi_retrieve(
       - Multi-query bonus: +15 % per additional query that also retrieved the chunk
         (chunks relevant to multiple phrasings are more likely to be truly relevant)
     """
-    queries = _expand_queries(question)
+    queries = _expand_queries(question, api_key=api_key)
 
     score_map: dict[str, float] = {}   # chunk_id → best base score
     chunk_map: dict[str, SearchResult] = {}
@@ -280,7 +281,7 @@ def _multi_retrieve(
 # Retrieval
 # ─────────────────────────────────────────────────────────────
 
-def retrieve(repo_id: str, question: str) -> tuple[list[SearchResult], list[SearchResult]]:
+def retrieve(repo_id: str, question: str, api_key: str = "") -> tuple[list[SearchResult], list[SearchResult]]:
     """
     Multi-query hybrid retrieval + import-graph augmentation.
     Returns (semantic_results, graph_results).
@@ -289,7 +290,7 @@ def retrieve(repo_id: str, question: str) -> tuple[list[SearchResult], list[Sear
     if store is None:
         raise ValueError(f"Repository '{repo_id}' is not indexed yet.")
 
-    semantic = _multi_retrieve(store, question, TOP_K_SEMANTIC, TOP_K_FINAL)
+    semantic = _multi_retrieve(store, question, TOP_K_SEMANTIC, TOP_K_FINAL, api_key=api_key)
 
     graph = _get_graph(repo_id)
     graph_results: list[SearchResult] = []
@@ -376,6 +377,7 @@ def _format_context(
 def stream_answer(
     repo_id: str,
     question: str,
+    api_key: str = "",
 ) -> Generator[list[Source] | dict | str, None, None]:
     """
     Yields:
@@ -392,7 +394,7 @@ def stream_answer(
 
     # Multi-query retrieval
     yield {"type": "status", "msg": "Expanding queries and retrieving context…"}
-    semantic, graph_results = retrieve(repo_id, question)
+    semantic, graph_results = retrieve(repo_id, question, api_key=api_key)
     sources = build_sources(semantic, graph_results)
     yield sources  # type: ignore[misc]
 
@@ -404,4 +406,5 @@ def stream_answer(
         store, question,
         source_type=source_type,
         initial_context=initial_context,
+        api_key=api_key,
     )

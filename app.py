@@ -62,6 +62,8 @@ st.markdown(
 )
 
 # ── Session state defaults ────────────────────────────────────
+if "groq_api_key" not in st.session_state:
+    st.session_state.groq_api_key = os.environ.get("GROQ_API_KEY", "")
 if "mode" not in st.session_state:
     st.session_state.mode = "github"          # "github" | "pdf"
 if "repo_id" not in st.session_state:
@@ -147,6 +149,34 @@ def render_sources(sources: list) -> None:
 
 with st.sidebar:
     st.markdown("## 📚 RAG Assistant")
+    st.divider()
+
+    # ── Groq API key ─────────────────────────────────────────
+    if st.session_state.groq_api_key:
+        st.markdown(
+            "<small>🔑 Groq API key set "
+            "<span style='color:#a6e3a1'>✓</span></small>",
+            unsafe_allow_html=True,
+        )
+        if st.button("Change key", use_container_width=True):
+            st.session_state.groq_api_key = ""
+            st.rerun()
+    else:
+        st.markdown("**Enter your Groq API key to get started**")
+        key_input = st.text_input(
+            "Groq API key",
+            type="password",
+            placeholder="gsk_...",
+            help="Get a free key at console.groq.com",
+            label_visibility="collapsed",
+        )
+        if key_input.strip():
+            st.session_state.groq_api_key = key_input.strip()
+            os.environ["GROQ_API_KEY"] = key_input.strip()
+            st.rerun()
+        st.caption("Get a free key at [console.groq.com](https://console.groq.com)")
+        st.stop()
+
     st.divider()
 
     # ── Mode toggle ──────────────────────────────────────────
@@ -326,17 +356,10 @@ with st.sidebar:
 
     # ── Environment status (shared) ──────────────────────────
     st.divider()
-    try:
-        import ollama as _ollama
-        _ollama.list()
-        ollama_status = "✅ Running"
-    except Exception:
-        ollama_status = "❌ Not running"
     st.markdown("**Environment**")
     st.markdown(
-        f"<small>Ollama: {ollama_status}<br>"
-        f"Generation: <code>llama3.2</code><br>"
-        f"Embeddings: <code>mxbai-embed-large</code><br>"
+        f"<small>Generation: <code>llama-3.3-70b-versatile</code> (Groq)<br>"
+        f"Embeddings: <code>mxbai-embed-large</code> (Ollama/local)<br>"
         f"GITHUB_TOKEN: {'✅ Set' if os.getenv('GITHUB_TOKEN') else '⚪ Optional'}</small>",
         unsafe_allow_html=True,
     )
@@ -441,7 +464,7 @@ else:
             collected_sources: list[Source] = []
 
             try:
-                for item in stream_answer(repo_id, question):
+                for item in stream_answer(repo_id, question, api_key=st.session_state.groq_api_key):
                     if isinstance(item, list):
                         # Initial source retrieval
                         collected_sources = item

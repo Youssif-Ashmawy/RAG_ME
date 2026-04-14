@@ -1,9 +1,9 @@
 """
-Embeddings — uses Ollama's local mxbai-embed-large model.
+Embeddings — Ollama local mxbai-embed-large (lightweight REST client).
 
 mxbai-embed-large uses asymmetric retrieval:
   - Documents: embed as-is
-  - Queries:   prepend the QUERY_PREFIX so the model optimises for retrieval
+  - Queries:   prepend QUERY_PREFIX so the model optimises for retrieval
 
 Pull once with: ollama pull mxbai-embed-large
 """
@@ -15,16 +15,11 @@ import ollama
 EMBEDDING_MODEL = "mxbai-embed-large"
 QUERY_PREFIX    = "Represent this sentence for searching relevant passages: "
 BATCH_SIZE      = 50
-# mxbai-embed-large accepts up to 512 tokens; cap chars at 1500 (~375 tokens)
-# to stay safely within the window even for dense code content.
 MAX_EMBED_CHARS = 1_500
 
 
 def embed_texts(texts: list[str], **_) -> list[list[float]]:
-    """
-    Embed a list of document strings (no query prefix).
-    Batches requests; truncates each text at MAX_EMBED_CHARS.
-    """
+    """Embed a list of document strings (no query prefix)."""
     all_embeddings: list[list[float]] = []
     for i in range(0, len(texts), BATCH_SIZE):
         batch = [t[:MAX_EMBED_CHARS] for t in texts[i : i + BATCH_SIZE]]
@@ -35,10 +30,7 @@ def embed_texts(texts: list[str], **_) -> list[list[float]]:
 
 def embed_text(text: str, **_) -> list[float]:
     """Embed a single document string (no query prefix)."""
-    response = ollama.embed(
-        model=EMBEDDING_MODEL,
-        input=[text[:MAX_EMBED_CHARS]],
-    )
+    response = ollama.embed(model=EMBEDDING_MODEL, input=[text[:MAX_EMBED_CHARS]])
     return response.embeddings[0]
 
 

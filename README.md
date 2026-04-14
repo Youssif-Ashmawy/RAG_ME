@@ -91,18 +91,19 @@ The system retrieves the most relevant context using hybrid search, then a two-p
 | Keyword search | `rank-bm25` (BM25Okapi) |
 | PDF parsing | `pdfplumber` |
 | Code parsing | AST (Python), regex (JS/TS/Go/Rust/…) |
+| Embedding runtime | Ollama (`mxbai-embed-large`) |
 
 ---
 
 ## Requirements
 
 - Python 3.10+
-- [Ollama](https://ollama.com) running locally
+- [Ollama](https://ollama.com) running locally — used for embeddings only
+- A free [Groq API key](https://console.groq.com) — entered in the sidebar on first launch
 
-Pull the required models once:
+Pull the embedding model once:
 
 ```bash
-ollama pull llama3.2
 ollama pull mxbai-embed-large
 ```
 

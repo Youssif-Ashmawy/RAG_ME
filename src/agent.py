@@ -5,33 +5,32 @@ Phase 1 — Context gathering (ReAct agent, tool calls only):
   The agent runs up to MAX_GATHER_ITERS steps using search/get tools to
   collect relevant context.  Its own "Final Answer" text is discarded.
 
-Phase 2 — Direct synthesis (streaming ollama.chat):
+Phase 2 — Direct synthesis (streaming Groq chat):
   All gathered context (initial retrieval + tool observations) is bundled
   into a system prompt and streamed back token-by-token.
 
 Why two phases?
-  Asking a 3B local model to simultaneously reason through a ReAct loop AND
-  write a comprehensive answer is too much.  Separating the two tasks makes
-  each one simple enough for the model to handle reliably.
+  Separating tool-call reasoning from synthesis makes each task simple
+  enough for the model to handle reliably without context overflow.
 """
 
 from __future__ import annotations
 
+import os
 from typing import Generator, Literal
 
-import ollama
+import groq as groq_sdk
 from langchain.agents import AgentExecutor, create_react_agent
 from langchain_core.prompts import PromptTemplate
 from langchain_core.tools import Tool
-from langchain_ollama import ChatOllama
+from langchain_groq import ChatGroq
 
 from .embeddings import embed_query
 from .vector_store import VectorStore
 
-AGENT_MODEL     = "llama3.2"
-NUM_CTX         = 8192   # override Ollama's 2048-token default
-TOP_K_AGENT     = 6      # results per tool search call
-MAX_GATHER_ITERS = 4     # max tool-call steps in phase 1
+AGENT_MODEL      = "llama-3.3-70b-versatile"
+TOP_K_AGENT      = 6
+MAX_GATHER_ITERS = 4
 
 SourceType = Literal["code", "document"]
 
@@ -121,7 +120,6 @@ def _make_tools(store: VectorStore, is_doc: bool) -> list[Tool]:
         return "\n\n---\n\n".join(c.text for c in chunks)
 
     def _list_sections(_input: str) -> str:
-        """Return all unique headings/sections indexed in the document."""
         headings: list[str] = []
         seen: set[str] = set()
         for c in store._chunks:
@@ -134,7 +132,6 @@ def _make_tools(store: VectorStore, is_doc: bool) -> list[Tool]:
         return "Indexed sections:\n" + "\n".join(f"- {h}" for h in headings)
 
     def _list_files(_input: str) -> str:
-        """Return all unique file paths indexed."""
         paths = sorted({c.path for c in store._chunks})
         if not paths:
             return "No files found in index."
@@ -168,19 +165,13 @@ def _gather_context(
     store: VectorStore,
     question: str,
     source_type: SourceType,
+    api_key: str,
 ) -> tuple[list[dict], list[str]]:
-    """
-    Run the ReAct agent in gather-only mode.
-
-    Returns:
-      tool_events   — list of {"type":"tool_call","name":...,"query":...} for the UI
-      observations  — list of raw tool result strings
-    """
     is_doc = source_type == "document"
     tools  = _make_tools(store, is_doc)
 
     prompt = PromptTemplate.from_template(_GATHER_TMPL)
-    llm    = ChatOllama(model=AGENT_MODEL, temperature=0, num_ctx=NUM_CTX)
+    llm    = ChatGroq(model=AGENT_MODEL, temperature=0, groq_api_key=api_key)
 
     agent    = create_react_agent(llm, tools, prompt)
     executor = AgentExecutor(
@@ -220,8 +211,8 @@ def _synthesise(
     source_type: SourceType,
     initial_context: str,
     tool_observations: list[str],
+    api_key: str,
 ) -> Generator[str, None, None]:
-    """Stream the final answer from the LLM given all gathered context."""
     base_prompt = _DOCUMENT_SYNTHESIS if source_type == "document" else _CODE_SYNTHESIS
 
     context_parts: list[str] = []
@@ -232,17 +223,17 @@ def _synthesise(
     context_block = "\n\n---\n\n".join(context_parts)
     system = f"{base_prompt}\n\n{context_block}" if context_block else base_prompt
 
-    stream = ollama.chat(
+    client = groq_sdk.Groq(api_key=api_key)
+    stream = client.chat.completions.create(
         model=AGENT_MODEL,
         messages=[
             {"role": "system", "content": system},
             {"role": "user",   "content": question},
         ],
         stream=True,
-        options={"num_ctx": NUM_CTX},
     )
     for chunk in stream:
-        text = chunk.message.content
+        text = chunk.choices[0].delta.content
         if text:
             yield text
 
@@ -256,15 +247,16 @@ def run_agent_stream(
     question: str,
     source_type: SourceType = "code",
     initial_context: str = "",
+    api_key: str = "",
 ) -> Generator[dict | str, None, None]:
     """
     Yields:
       {"type": "tool_call", "name": str, "query": str}  — each tool invocation
       str                                                 — final answer tokens
     """
-    # Phase 1: gather additional context via tools
-    tool_events, observations = _gather_context(store, question, source_type)
+    resolved_key = api_key or os.environ.get("GROQ_API_KEY", "")
+
+    tool_events, observations = _gather_context(store, question, source_type, resolved_key)
     yield from tool_events
 
-    # Phase 2: synthesise and stream the answer
-    yield from _synthesise(question, source_type, initial_context, observations)
+    yield from _synthesise(question, source_type, initial_context, observations, resolved_key)
