@@ -33,7 +33,6 @@ from .code_parser import parse_file
 from .embeddings import embed_query, embed_texts
 from .github_client import fetch_repo_files
 from .import_graph import ImportGraph
-from .pdf_parser import parse_pdf
 from .vector_store import (
     SearchResult, VectorStore,
     get_store, set_store, _cache_dir,
@@ -45,7 +44,6 @@ TOP_K_SEMANTIC   = 14   # chunks retrieved per query pass
 TOP_K_FINAL      = 10   # chunks kept after multi-query merge
 TOP_K_GRAPH      = 4    # extra chunks from graph neighbours
 GRAPH_DEPTH      = 1
-PDF_ID_PREFIX    = "pdf__"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -168,53 +166,6 @@ def ingest_repo(
         chunks_count=len(chunks),
         graph_edges=graph.edge_count,
         files=store.indexed_files(),
-    )
-
-
-# ─────────────────────────────────────────────────────────────
-# PDF ingestion
-# ─────────────────────────────────────────────────────────────
-
-def ingest_pdf(
-    file_bytes: bytes,
-    filename: str,
-    on_progress: Optional[Callable[[str, int], None]] = None,
-) -> IngestResult:
-    def progress(msg: str, pct: int) -> None:
-        if on_progress:
-            on_progress(msg, pct)
-
-    safe_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", filename)
-    repo_id   = f"{PDF_ID_PREFIX}{safe_name}"
-
-    progress("Parsing PDF…", 10)
-    chunks = parse_pdf(file_bytes, filename)
-
-    progress(f"Embedding {len(chunks)} chunks…", 30)
-    texts: list[str] = [c.text for c in chunks]
-    all_embeddings: list[list[float]] = []
-
-    for i in range(0, len(texts), EMBED_BATCH):
-        batch = texts[i : i + EMBED_BATCH]
-        all_embeddings.extend(embed_texts(batch))
-        done = min(i + EMBED_BATCH, len(texts))
-        pct  = 30 + int((done / len(texts)) * 60)
-        progress(f"Embedded {done}/{len(texts)} chunks…", pct)
-
-    progress("Saving index…", 95)
-    store = VectorStore()
-    store.add(chunks, all_embeddings)
-    store.save(repo_id)
-    set_store(repo_id, store)
-    _clear_other_caches(repo_id)
-
-    progress("Done!", 100)
-    return IngestResult(
-        repo_id=repo_id,
-        files_count=1,
-        chunks_count=len(chunks),
-        graph_edges=0,
-        files=[{"path": filename, "file_type": "pdf", "chunks": len(chunks)}],
     )
 
 
@@ -415,8 +366,6 @@ def stream_answer(
     if store is None:
         raise ValueError(f"Repository '{repo_id}' is not indexed yet.")
 
-    source_type = "document" if repo_id.startswith(PDF_ID_PREFIX) else "code"
-
     # Multi-query retrieval
     yield {"type": "status", "msg": "Expanding queries and retrieving context…"}
     semantic, graph_results = retrieve(repo_id, question, api_key=api_key)
@@ -429,7 +378,7 @@ def stream_answer(
     yield {"type": "status", "msg": "Agent reasoning…"}
     yield from run_agent_stream(
         store, question,
-        source_type=source_type,
+        source_type="code",
         initial_context=initial_context,
         api_key=api_key,
     )
