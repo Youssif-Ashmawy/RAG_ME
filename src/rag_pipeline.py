@@ -382,3 +382,42 @@ def stream_answer(
         initial_context=initial_context,
         api_key=api_key,
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# Diagram explanation
+# ─────────────────────────────────────────────────────────────
+
+def stream_diagram_explanation(
+    graph_summary: str,
+    api_key: str = "",
+) -> Generator[str, None, None]:
+    """
+    Stream a plain-English explanation of the dependency graph.
+    `graph_summary` is produced by diagram.build_graph_summary().
+    """
+    system = (
+        "You are a senior software architect. "
+        "A developer has just indexed a codebase and generated a dependency graph. "
+        "Based on the graph data below, explain the architecture clearly:\n"
+        "- What are the main modules/layers and what does each one do?\n"
+        "- What are the entry points?\n"
+        "- How do the files depend on each other — what is the overall data/control flow?\n"
+        "- Are there any notable patterns (e.g. layered, pipeline, hub-and-spoke)?\n"
+        "Be concise but thorough. Use plain language a new contributor would understand."
+        f"\n\n{graph_summary}"
+    )
+
+    client = groq_sdk.Groq(api_key=api_key or os.environ.get("GROQ_API_KEY", ""))
+    stream = client.chat.completions.create(
+        model=GENERATION_MODEL,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user",   "content": "Explain this codebase architecture."},
+        ],
+        stream=True,
+    )
+    for chunk in stream:
+        text = chunk.choices[0].delta.content
+        if text:
+            yield text

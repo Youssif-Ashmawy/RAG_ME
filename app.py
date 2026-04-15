@@ -17,7 +17,10 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import groq as _groq_sdk  # noqa: E402
 
-from src.rag_pipeline import IngestResult, Source, ingest_repo, stream_answer  # noqa: E402
+from src.diagram import build_mermaid, build_graph_summary  # noqa: E402
+from src.import_graph import ImportGraph  # noqa: E402
+from src.rag_pipeline import IngestResult, Source, ingest_repo, stream_answer, stream_diagram_explanation  # noqa: E402
+from src.vector_store import get_store, _cache_dir  # noqa: E402
 
 
 def _validate_groq_key(key: str) -> tuple[bool, str]:
@@ -92,6 +95,55 @@ if "ingest_result" not in st.session_state:
     st.session_state.ingest_result = None
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+
+# ═════════════════════════════════════════════════════════════
+# Diagram dialog
+# ═════════════════════════════════════════════════════════════
+
+@st.dialog("Dependency Diagram", width="large")
+def _show_diagram(repo_id: str) -> None:
+    store = get_store(repo_id)
+    if store is None:
+        st.error("Index not found.")
+        return
+
+    graph = ImportGraph.load(str(_cache_dir(repo_id)))
+    mermaid = build_mermaid(store, graph)
+
+    if not mermaid:
+        st.info("No dependency data found for this repository.")
+        return
+
+    edge_count = graph.edge_count if graph else 0
+    file_count = len({c.path for c in store._chunks})
+    st.caption(f"{file_count} files · {edge_count} import edges")
+
+    st.components.v1.html(
+        f"""<!DOCTYPE html>
+<html>
+<head>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>mermaid.initialize({{startOnLoad:true,theme:'dark',flowchart:{{useMaxWidth:true,htmlLabels:true}}}});</script>
+  <style>
+    body {{ margin:0; background:#0e1117; }}
+    .mermaid {{ width:100%; }}
+  </style>
+</head>
+<body>
+  <div class="mermaid">{mermaid}</div>
+</body>
+</html>""",
+        height=620,
+        scrolling=True,
+    )
+
+    st.divider()
+    if st.button("🤖 Explain this diagram", use_container_width=True, type="primary"):
+        summary = build_graph_summary(store, graph)
+        st.write_stream(
+            stream_diagram_explanation(summary, api_key=st.session_state.groq_api_key)
+        )
 
 
 # ═════════════════════════════════════════════════════════════
@@ -292,6 +344,11 @@ with st.sidebar:
                         f"<span style='color:#666'>· {chunks_label}</span></small>",
                         unsafe_allow_html=True,
                     )
+
+    if st.session_state.repo_id:
+        st.divider()
+        if st.button("📊 Dependency Diagram", use_container_width=True):
+            _show_diagram(st.session_state.repo_id)
 
     # ── Environment status ────────────────────────────────────
     st.divider()
