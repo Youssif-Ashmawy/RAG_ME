@@ -338,9 +338,9 @@ def _format_context(
             label += f" :: {c.unit_name}"
         elif c.heading:
             label += f" › {c.heading}"
-        snippet = c.text[:_CONTEXT_SNIPPET_CHARS].replace("\n", " ").strip()
+        snippet = c.text[:_CONTEXT_SNIPPET_CHARS].strip()
         if len(c.text) > _CONTEXT_SNIPPET_CHARS:
-            snippet += "…"
+            snippet += "\n…"
         parts.append(f"[{label}]\n{snippet}")
 
     return "\n\n".join(parts)

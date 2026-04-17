@@ -74,9 +74,12 @@ Question: {input}
 
 _CODE_SYNTHESIS = """\
 You are an expert software engineer. Answer the question using ONLY the retrieved context below.
-- Explain what the code does, trace data flow across files, highlight design patterns.
+- Always include the relevant code snippets using markdown code blocks (```language ... ```) \
+so the user can see the actual code.
+- After each snippet, explain what it does and how it fits into the bigger picture.
 - Reference sources by file path and function/class name.
-- Be thorough and specific. If context is insufficient, say so."""
+- Trace data flow across files and highlight design patterns where relevant.
+- If the context is insufficient to show the code, say so explicitly."""
 
 _DOCUMENT_SYNTHESIS = """\
 You are a precise document analyst. Answer the question using ONLY the retrieved context below.
