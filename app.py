@@ -88,7 +88,9 @@ st.markdown(
 
 # ── Session state defaults ────────────────────────────────────
 if "groq_api_key" not in st.session_state:
-    st.session_state.groq_api_key = os.environ.get("GROQ_API_KEY", "")
+    st.session_state.groq_api_key = ""
+if "github_token" not in st.session_state:
+    st.session_state.github_token = ""
 if "repo_id" not in st.session_state:
     st.session_state.repo_id = None
 if "ingest_result" not in st.session_state:
@@ -119,24 +121,16 @@ def _show_diagram(repo_id: str) -> None:
     file_count = len({c.path for c in store._chunks})
     st.caption(f"{file_count} files · {edge_count} import edges")
 
-    st.components.v1.html(
-        f"""<!DOCTYPE html>
-<html>
-<head>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-  <script>mermaid.initialize({{startOnLoad:true,theme:'dark',flowchart:{{useMaxWidth:true,htmlLabels:true}}}});</script>
-  <style>
-    body {{ margin:0; background:#0e1117; }}
-    .mermaid {{ width:100%; }}
-  </style>
-</head>
-<body>
-  <div class="mermaid">{mermaid}</div>
-</body>
-</html>""",
-        height=620,
-        scrolling=True,
+    import base64
+    _html = (
+        f'<!DOCTYPE html><html><head>'
+        f'<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>'
+        f'<script>mermaid.initialize({{startOnLoad:true,theme:"dark",flowchart:{{useMaxWidth:true,htmlLabels:true}}}});</script>'
+        f'<style>body{{margin:0;background:#0e1117}}.mermaid{{width:100%}}</style>'
+        f'</head><body><div class="mermaid">{mermaid}</div></body></html>'
     )
+    _src = "data:text/html;base64," + base64.b64encode(_html.encode()).decode()
+    st.iframe(src=_src, height=620)
 
     st.divider()
     if st.button("🤖 Explain this diagram", use_container_width=True, type="primary"):
@@ -224,41 +218,52 @@ with st.sidebar:
     st.markdown("## 📚 RAG ME Assistant")
     st.divider()
 
-    # ── Groq API key ─────────────────────────────────────────
+    # ── API keys ──────────────────────────────────────────────
     if st.session_state.groq_api_key:
         st.markdown(
-            "<small>🔑 Groq API key set "
-            "<span style='color:#a6e3a1'>✓</span></small>",
+            "<small>"
+            f"🔑 Groq key {'✓' if st.session_state.groq_api_key else '✗'} <br>"
+            f"{'🐙 GitHub token ✓' if st.session_state.github_token else '🐙 GitHub token <span style=\"color:#888\">optional</span>'} <br>"
+            "</small>",
             unsafe_allow_html=True,
         )
-        if st.button("Change key", use_container_width=True):
+        if st.button("Change keys", use_container_width=True):
             st.session_state.groq_api_key = ""
+            st.session_state.github_token = ""
             st.rerun()
     else:
-        st.markdown("**Enter your Groq API key to get started**")
+        st.markdown("**Enter your API keys to get started**")
         with st.form("groq_key_form", border=False):
             key_input = st.text_input(
                 "Groq API key",
                 type="password",
-                placeholder="gsk_...",
-                label_visibility="collapsed",
+                placeholder="gsk_…",
             )
+            gh_input = st.text_input(
+                "GitHub token (optional)",
+                type="password",
+                placeholder="ghp_…",
+            )
+            st.caption("Recommended for large repos as it raises GitHub API rate limit from 60 to 5,000 requests/hour.")
             submitted = st.form_submit_button(
                 "Connect", use_container_width=True, type="primary"
             )
         if submitted:
             if not key_input.strip():
-                st.error("Please enter an API key.")
+                st.error("Please enter a Groq API key.")
             else:
-                with st.spinner("Validating key…"):
+                with st.spinner("Validating Groq key…"):
                     valid, err = _validate_groq_key(key_input.strip())
                 if valid:
                     st.session_state.groq_api_key = key_input.strip()
-                    os.environ["GROQ_API_KEY"] = key_input.strip()
+                    st.session_state.github_token = gh_input.strip()
                     st.rerun()
                 else:
                     st.error(err)
-        st.caption("Get a free key at [console.groq.com](https://console.groq.com)")
+        st.caption(
+            "Groq key: [console.groq.com](https://console.groq.com)  \n"
+            "GitHub token *(optional)*: [github.com/settings/tokens](https://github.com/settings/tokens) "
+        )
         st.stop()
 
     st.divider()
@@ -298,7 +303,10 @@ with st.sidebar:
             progress_bar.progress(pct / 100)
 
         try:
-            result: IngestResult = ingest_repo(repo_url.strip(), on_progress)
+            result: IngestResult = ingest_repo(
+                repo_url.strip(), on_progress,
+                github_token=st.session_state.github_token,
+            )
             st.session_state.repo_id       = result.repo_id
             st.session_state.ingest_result = result
             st.session_state.messages      = []
@@ -355,7 +363,7 @@ with st.sidebar:
     st.markdown("**Environment**")
     st.markdown(
         f"<small>Generation: <code>llama-3.3-70b-versatile</code> (Groq)<br>"
-        f"Embeddings: <code>mxbai-embed-large</code> (Ollama/local)<br>"
+        f"Embeddings: <code>mxbai-embed-large</code> (fastembed/local)<br>"
         f"GITHUB_TOKEN: {'✅ Set' if os.getenv('GITHUB_TOKEN') else '⚪ Optional'}</small>",
         unsafe_allow_html=True,
     )

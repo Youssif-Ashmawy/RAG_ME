@@ -1,37 +1,45 @@
 """
-Embeddings — Ollama local mxbai-embed-large (lightweight REST client).
+Embeddings — fastembed (ONNX runtime, no Ollama server required).
 
-mxbai-embed-large uses asymmetric retrieval:
-  - Documents: embed as-is
-  - Queries:   prepend QUERY_PREFIX so the model optimises for retrieval
+Uses mixedbread-ai/mxbai-embed-large-v1 with asymmetric retrieval:
+  - Documents: embed as-is  (embed_texts / embed_text)
+  - Queries:   query_embed adds the asymmetric prefix internally
 
-Pull once with: ollama pull mxbai-embed-large
+The ONNX model (~550 MB) is downloaded once to ~/.cache/fastembed/ on first use.
+Set FASTEMBED_CACHE_PATH env var to override the cache location.
 """
 
 from __future__ import annotations
 
-import ollama
+from fastembed import TextEmbedding
 
-EMBEDDING_MODEL = "mxbai-embed-large"
-QUERY_PREFIX    = "Represent this sentence for searching relevant passages: "
+EMBEDDING_MODEL = "mixedbread-ai/mxbai-embed-large-v1"
 BATCH_SIZE      = 50
-MAX_EMBED_CHARS = 800   # mxbai-embed-large: 512-token ctx; dense code ~2 chars/token → 400 tokens
+MAX_EMBED_CHARS = 800   # 512-token ctx; dense code ~2 chars/token → 400 tokens
+
+_model: TextEmbedding | None = None
+
+
+def _get_model() -> TextEmbedding:
+    global _model
+    if _model is None:
+        _model = TextEmbedding(EMBEDDING_MODEL)
+    return _model
 
 
 def embed_texts(texts: list[str], **_) -> list[list[float]]:
     """Embed a list of document strings (no query prefix)."""
+    model = _get_model()
     all_embeddings: list[list[float]] = []
     for i in range(0, len(texts), BATCH_SIZE):
         batch = [t[:MAX_EMBED_CHARS] for t in texts[i : i + BATCH_SIZE]]
-        response = ollama.embed(model=EMBEDDING_MODEL, input=batch)
-        all_embeddings.extend(response.embeddings)
+        all_embeddings.extend(v.tolist() for v in model.embed(batch))
     return all_embeddings
 
 
 def embed_text(text: str, **_) -> list[float]:
     """Embed a single document string (no query prefix)."""
-    response = ollama.embed(model=EMBEDDING_MODEL, input=[text[:MAX_EMBED_CHARS]])
-    return response.embeddings[0]
+    return next(_get_model().embed([text[:MAX_EMBED_CHARS]])).tolist()
 
 
 def embed_query(text: str) -> list[float]:
@@ -39,6 +47,4 @@ def embed_query(text: str) -> list[float]:
     Embed a search query with the asymmetric retrieval prefix.
     Use this whenever embedding a user question, not a document.
     """
-    prefixed = QUERY_PREFIX + text[:MAX_EMBED_CHARS]
-    response = ollama.embed(model=EMBEDDING_MODEL, input=[prefixed])
-    return response.embeddings[0]
+    return next(_get_model().query_embed([text[:MAX_EMBED_CHARS]])).tolist()

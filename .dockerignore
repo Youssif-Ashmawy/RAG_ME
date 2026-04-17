@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.rag-cache/
+.streamlit/secrets.toml
+*.egg-info/
+.git/
+.gitignore
+README.md

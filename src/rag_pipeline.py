@@ -118,13 +118,14 @@ class Source:
 def ingest_repo(
     repo_url: str,
     on_progress: Optional[Callable[[str, int], None]] = None,
+    github_token: str = "",
 ) -> IngestResult:
     def progress(msg: str, pct: int) -> None:
         if on_progress:
             on_progress(msg, pct)
 
     progress("Connecting to GitHub…", 5)
-    token = os.getenv("GITHUB_TOKEN")
+    token = github_token or os.getenv("GITHUB_TOKEN")
     files, meta = fetch_repo_files(
         repo_url, token=token,
         on_progress=lambda msg: progress(msg, 10),

@@ -197,6 +197,8 @@ def _gather_context(
     for action, obs in result.get("intermediate_steps", []):
         tool_name  = getattr(action, "tool", "")
         tool_input = getattr(action, "tool_input", "")
+        if not tool_name:
+            continue  # skip parse-error pseudo-steps from handle_parsing_errors
         query = tool_input if isinstance(tool_input, str) else str(tool_input)
         tool_events.append({"type": "tool_call", "name": tool_name, "query": query})
         if isinstance(obs, str) and obs.strip():
