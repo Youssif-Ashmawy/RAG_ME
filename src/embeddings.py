@@ -1,11 +1,11 @@
 """
 Embeddings — fastembed (ONNX runtime, no Ollama server required).
 
-Uses mixedbread-ai/mxbai-embed-large-v1 with asymmetric retrieval:
+Uses BAAI/bge-small-en-v1.5 with asymmetric retrieval:
   - Documents: embed as-is  (embed_texts / embed_text)
   - Queries:   query_embed adds the asymmetric prefix internally
 
-The ONNX model (~550 MB) is downloaded once to ~/.cache/fastembed/ on first use.
+The ONNX model (~130 MB) is downloaded once to ~/.cache/fastembed/ on first use.
 Set FASTEMBED_CACHE_PATH env var to override the cache location.
 """
 
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from fastembed import TextEmbedding
 
-EMBEDDING_MODEL = "mixedbread-ai/mxbai-embed-large-v1"
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 BATCH_SIZE      = 50
 MAX_EMBED_CHARS = 800   # 512-token ctx; dense code ~2 chars/token → 400 tokens
 
