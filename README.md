@@ -15,7 +15,7 @@ A cloud-ready Retrieval-Augmented Generation (RAG) system that lets you chat wit
 |---|---|
 | UI | [Streamlit](https://streamlit.io) |
 | LLM inference | [Groq](https://console.groq.com) (`llama-3.3-70b-versatile`) |
-| Embeddings | [fastembed](https://github.com/qdrant/fastembed) (`mxbai-embed-large`, local ONNX) |
+| Embeddings | [fastembed](https://github.com/qdrant/fastembed) (`bge-small-en-v1.5`, local ONNX) |
 | Agent framework | [LangChain](https://langchain.com) (`create_react_agent`) |
 | Vector search | NumPy cosine similarity |
 | Keyword search | `rank-bm25` (BM25Okapi) |
@@ -79,7 +79,7 @@ src/
   rag_pipeline.py    - Ingestion + query orchestration
   agent.py           - Two-phase LangChain ReAct agent
   vector_store.py    - Hybrid BM25 + vector store with RRF
-  embeddings.py      - fastembed wrapper (mxbai-embed-large)
+  embeddings.py      - fastembed wrapper (bge-small-en-v1.5)
   chunker.py         - Route files to the right chunking strategy
   code_parser.py     - AST/regex semantic unit extractor
   github_client.py   - GitHub REST API file fetcher
