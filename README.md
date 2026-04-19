@@ -2,7 +2,7 @@
 
 A cloud-ready Retrieval-Augmented Generation (RAG) system that lets you chat with any **public GitHub repository**. Powered by [Groq](https://console.groq.com) for fast LLM inference and [fastembed](https://github.com/qdrant/fastembed) for fully local embeddings. No local GPU required.
 
-🌐 Live site: https://rag-me.streamlit.app/
+##### 🌐 Live site: https://rag-me.streamlit.app/
 ---
 
 ## Architecture
